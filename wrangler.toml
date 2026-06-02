@@ -1,0 +1,32 @@
+#:schema node_modules/wrangler/config-schema.json
+# ─── Configuration Cloudflare Worker pour Astrid Navig ──────────
+# Ce fichier indique à Cloudflare ce qu'il faut créer automatiquement
+# quand quelqu'un clique sur le bouton "Deploy to Cloudflare"
+
+name = "passerelle-astrid"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+# ─── Workers Logs (pour surveiller les erreurs gratuitement) ─────
+[observability]
+enabled = true
+
+# ─── KV Namespaces (provisionnés automatiquement par Cloudflare) ─
+# Le champ id sera rempli automatiquement lors du déploiement.
+
+[[kv_namespaces]]
+binding = "CONAV_SESSIONS"
+id = ""
+
+[[kv_namespaces]]
+binding = "RATELIMIT"
+id = ""
+
+# ─── Variables d'environnement (optionnelles) ──────────────────
+# Pour ajouter ton propre secret HMAC (pour les institutions B2B) :
+# 1. Va sur Cloudflare → ton Worker → Settings → Variables
+# 2. Ajoute ASTRID_SHARED_SECRET avec une valeur unique
+# (Si non défini, le Worker utilise le secret par défaut du code client)
+
+# [vars]
+# ASTRID_SHARED_SECRET = "ton-secret-unique-ici"

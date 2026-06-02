@@ -1,0 +1,15 @@
+{
+  "name": "passerelle-astrid",
+  "version": "1.0.0",
+  "description": "Worker Cloudflare pour Astrid Navig — passerelle web + co-navigation + heartbeat",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "license": "MIT",
+  "private": false
+}
