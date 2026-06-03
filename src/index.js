@@ -386,6 +386,15 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     var href = a.getAttribute('href');
     if (!href || href.indexOf('javascript:') === 0 || href.charAt(0) === '#') return;
     if (href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) return;
+    // 🆕 Ne PAS intercepter si le site gère lui-même le clic en JS (SPA, modale
+    //    d'inscription, routeur interne). Si un autre handler a déjà appelé
+    //    preventDefault, ou si le lien ouvre dans un nouvel onglet, on laisse faire.
+    if (e.defaultPrevented) return;
+    if (a.getAttribute('target') === '_blank') return;
+    if (a.hasAttribute('download')) return;
+    // 🆕 Si le lien a un rôle bouton ou un handler onclick, c'est du JS applicatif :
+    //    on laisse le site travailler (ex: ouvrir la fenêtre d'inscription Canal+).
+    if (a.getAttribute('role') === 'button' || a.hasAttribute('onclick')) return;
     var absoluteUrl;
     try { absoluteUrl = new URL(href, document.baseURI).href; } catch (err) { return; }
     if (absoluteUrl.indexOf(PROXY_ORIGIN) === 0) return;
@@ -396,7 +405,7 @@ function buildBridgeScript(proxyOrigin, targetHost) {
       a.setAttribute('target', '_blank');
       a.setAttribute('rel', 'noopener noreferrer');
     }
-  }, true);
+  }, false);
 
   // ── Signal "bridge prêt" envoyé au parent (Astrid) ──
   function sendReady() {
@@ -680,12 +689,12 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     }
 
     // 🆕 Mode senior : cercle et label plus gros et plus contrastés
-    var BORDER_W   = largeMode ? '5px' : '3px';
+    var BORDER_W   = largeMode ? '6px' : '5px';
     var INSET      = largeMode ? '-10px' : '-6px';
     var BORDER_RAD = largeMode ? '14px' : '10px';
     var SHADOW_BASE = largeMode
-      ? '0 0 0 7px rgba(255,149,0,0.35),0 0 32px rgba(255,149,0,0.7)'
-      : '0 0 0 4px rgba(255,149,0,0.25),0 0 22px rgba(255,149,0,0.5)';
+      ? '0 0 0 8px rgba(255,106,0,0.45),0 0 44px 10px rgba(255,140,0,0.95),0 0 80px 20px rgba(255,90,0,0.6)'
+      : '0 0 0 5px rgba(255,106,0,0.45),0 0 36px 8px rgba(255,140,0,0.95),0 0 64px 16px rgba(255,90,0,0.55)';
     var LABEL_FONT  = largeMode ? '16px' : '12px';
     var LABEL_PAD   = largeMode ? '11px 18px' : '7px 12px';
     var LABEL_RAD   = largeMode ? '12px' : '9px';
@@ -695,13 +704,13 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     overlay.id = HIGHLIGHT_ID;
     overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;transition:transform .2s ease;';
     overlay.innerHTML = (
-      '<div style="position:absolute;inset:' + INSET + ';border:' + BORDER_W + ' solid #FF9500;border-radius:' + BORDER_RAD + ';' +
+      '<div style="position:absolute;inset:' + INSET + ';border:' + BORDER_W + ' solid #FF6A00;border-radius:' + BORDER_RAD + ';' +
       'box-shadow:' + SHADOW_BASE + ';' +
       'animation:oapiHighlightPulse 1.4s ease-in-out infinite"></div>' +
       (label ? ('<div style="position:absolute;left:50%;transform:translateX(-50%);top:100%;margin-top:' + (largeMode ? '18px' : '14px') + ';' +
       'background:#1F1135;color:#FFE8B5;padding:' + LABEL_PAD + ';border-radius:' + LABEL_RAD + ';font-size:' + LABEL_FONT + ';font-weight:' + (largeMode ? '800' : '700') + ';' +
       'font-family:system-ui,sans-serif;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,0.3);' +
-      'max-width:' + LABEL_MAXW + ';overflow:hidden;text-overflow:ellipsis">☝️ ' +
+      'max-width:' + LABEL_MAXW + ';overflow:hidden;text-overflow:ellipsis">👆 ' +
       String(label).replace(/</g, '&lt;') + '</div>') : '')
     );
 
@@ -709,7 +718,7 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     if (!document.getElementById('oapi-highlight-style')) {
       var st = document.createElement('style');
       st.id = 'oapi-highlight-style';
-      st.textContent = '@keyframes oapiHighlightPulse{0%,100%{box-shadow:0 0 0 4px rgba(255,149,0,0.25),0 0 22px rgba(255,149,0,0.5)}50%{box-shadow:0 0 0 12px rgba(255,149,0,0),0 0 36px rgba(255,149,0,0.8)}}';
+      st.textContent = '@keyframes oapiHighlightPulse{0%,100%{box-shadow:0 0 0 5px rgba(255,106,0,0.45),0 0 36px 8px rgba(255,140,0,0.95),0 0 64px 16px rgba(255,90,0,0.55)}50%{box-shadow:0 0 0 10px rgba(255,106,0,0.3),0 0 48px 14px rgba(255,150,0,1),0 0 90px 26px rgba(255,90,0,0.7)}}';
       document.head.appendChild(st);
     }
 
