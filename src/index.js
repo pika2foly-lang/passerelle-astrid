@@ -990,49 +990,79 @@ async function heartbeatReceive(request, env) {
     return jsonResponse({ error: 'JSON invalide' }, 400);
   }
 
-  // Whitelist stricte : on n'accepte QUE ces 4 champs, rien d'autre
-  const event = String(body.event || '').substring(0, 32).replace(/[^a-z0-9_-]/gi, '');
-  const success = body.success === true || body.success === false ? body.success : null;
-  const domain = String(body.domain || '').substring(0, 80).replace(/[^a-z0-9.\-]/gi, '');
-  const duration = typeof body.duration === 'number' && body.duration >= 0 && body.duration < 600000
-    ? Math.round(body.duration) : null;
-
-  if (!event) return jsonResponse({ ok: false, reason: 'event manquant' }, 400);
-
-  // Rate limit par IP : max 200 heartbeats / 10 min (anti-spam)
+  // 🛡️ Rate limit par IP : 50 requêtes / 10 min / IP (chaque requête peut contenir un batch)
+  // Réduit de 200 → 50 pour encourager le batching côté client
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-  if (await rateLimitByIP(env, ip, 'hb', 200, 600)) {
+  if (await rateLimitByIP(env, ip, 'hb', 50, 600)) {
     return jsonResponse({ ok: false, reason: 'rate limit' }, 429);
   }
 
-  // Agrégation par jour-événement-résultat
-  const day = new Date().toISOString().substring(0, 10); // "2026-06-01"
-  const outcome = success === null ? 'na' : (success ? 'ok' : 'fail');
-  const key = 'hb:' + day + ':' + event + ':' + outcome;
-
-  try {
-    const cur = await env.CONAV_SESSIONS.get(key);
-    const agg = cur ? JSON.parse(cur) : { count: 0, domains: {}, durationSum: 0, durationCount: 0 };
-    agg.count++;
-    if (domain) agg.domains[domain] = (agg.domains[domain] || 0) + 1;
-    if (duration !== null) {
-      agg.durationSum += duration;
-      agg.durationCount++;
-    }
-    // Cap les domains à 100 (anti-pollution)
-    const domainKeys = Object.keys(agg.domains);
-    if (domainKeys.length > 100) {
-      // Garde les 50 plus fréquents
-      const sorted = domainKeys.sort((a, b) => agg.domains[b] - agg.domains[a]).slice(0, 50);
-      const trimmed = {};
-      sorted.forEach(k => trimmed[k] = agg.domains[k]);
-      agg.domains = trimmed;
-    }
-    await env.CONAV_SESSIONS.put(key, JSON.stringify(agg), { expirationTtl: 7 * 86400 });
-  } catch (e) {
-    // Silencieux : un fail heartbeat ne doit pas casser l'app
+  // Détecte si c'est un batch (nouveau format) ou un event unique (ancien format)
+  let events = [];
+  if (body && Array.isArray(body.batch)) {
+    // Nouveau format : { batch: [event1, event2, ...] }
+    events = body.batch.slice(0, 50); // cap à 50 events/batch (anti-abus)
+  } else if (body && body.event) {
+    // Ancien format : { event, success, domain, duration }
+    events = [body];
+  } else {
+    return jsonResponse({ error: 'Format invalide' }, 400);
   }
-  return jsonResponse({ ok: true });
+
+  // 🛡️ Agrégation : on accumule tous les events dans une map en mémoire
+  // Puis on fait UNE écriture KV par bucket day-event-outcome
+  const buckets = new Map();
+  for (const evt of events) {
+    if (!evt) continue;
+    // Whitelist stricte
+    const event = String(evt.event || '').substring(0, 32).replace(/[^a-z0-9_-]/gi, '');
+    const success = evt.success === true || evt.success === false ? evt.success : null;
+    const domain = String(evt.domain || '').substring(0, 80).replace(/[^a-z0-9.\-]/gi, '');
+    const duration = typeof evt.duration === 'number' && evt.duration >= 0 && evt.duration < 600000
+      ? Math.round(evt.duration) : null;
+    if (!event) continue;
+
+    const day = new Date(evt.ts || Date.now()).toISOString().substring(0, 10);
+    const outcome = success === null ? 'na' : (success ? 'ok' : 'fail');
+    const key = 'hb:' + day + ':' + event + ':' + outcome;
+
+    if (!buckets.has(key)) {
+      buckets.set(key, { count: 0, domains: {}, durationSum: 0, durationCount: 0 });
+    }
+    const b = buckets.get(key);
+    b.count++;
+    if (domain) b.domains[domain] = (b.domains[domain] || 0) + 1;
+    if (duration !== null) {
+      b.durationSum += duration;
+      b.durationCount++;
+    }
+  }
+
+  // 🛡️ Écriture KV : UNE write par bucket (même si N events)
+  for (const [key, newAgg] of buckets) {
+    try {
+      const cur = await env.CONAV_SESSIONS.get(key);
+      const agg = cur ? JSON.parse(cur) : { count: 0, domains: {}, durationSum: 0, durationCount: 0 };
+      agg.count += newAgg.count;
+      for (const [d, c] of Object.entries(newAgg.domains)) {
+        agg.domains[d] = (agg.domains[d] || 0) + c;
+      }
+      agg.durationSum += newAgg.durationSum;
+      agg.durationCount += newAgg.durationCount;
+      // Cap les domains à 100 (anti-pollution)
+      const dKeys = Object.keys(agg.domains);
+      if (dKeys.length > 100) {
+        const sorted = dKeys.sort((a, b) => agg.domains[b] - agg.domains[a]).slice(0, 50);
+        const trimmed = {};
+        sorted.forEach(k => trimmed[k] = agg.domains[k]);
+        agg.domains = trimmed;
+      }
+      await env.CONAV_SESSIONS.put(key, JSON.stringify(agg), { expirationTtl: 7 * 86400 });
+    } catch (e) {
+      // Silencieux : un fail sur un bucket ne bloque pas les autres
+    }
+  }
+  return jsonResponse({ ok: true, processed: events.length, buckets: buckets.size });
 }
 
 // GET /heartbeat/stats — vue agrégée des 7 derniers jours
