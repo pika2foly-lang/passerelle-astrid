@@ -425,7 +425,7 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     var s = String(label);
     if (s.length > 80) s = s.substring(0, 80);
     s = s.replace(/[\u0000-\u001F\u007F]+/g, ' ');
-    s = s.replace(/["`]/g, "'");
+    s = s.replace(/"/g, '').replace(/'/g, '');
     // Détection grossière d'injection — si trouvé on remplace
     var bad = /\b(ignore|disregard|forget)\s+(all|previous|tout)\b|\b(you are now|tu es maintenant|jailbreak)\b|\[INST\]|<\|.+?\|>/i;
     if (bad.test(s)) return '[filtered]';
