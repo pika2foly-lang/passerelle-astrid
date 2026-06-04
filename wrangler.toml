@@ -16,11 +16,11 @@ enabled = true
 
 [[kv_namespaces]]
 binding = "CONAV_SESSIONS"
-id = ""
+id = "2ba5b77db84345c092cdf67b510b9d00"
 
 [[kv_namespaces]]
 binding = "RATELIMIT"
-id = ""
+id = "307e80f3347843109897576fc2e17f19"
 
 # ─── Variables d'environnement (optionnelles) ──────────────────
 # Pour ajouter ton propre secret HMAC (pour les institutions B2B) :
