@@ -386,15 +386,9 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     var href = a.getAttribute('href');
     if (!href || href.indexOf('javascript:') === 0 || href.charAt(0) === '#') return;
     if (href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) return;
-    // 🆕 Ne PAS intercepter si le site gère lui-même le clic en JS (SPA, modale
-    //    d'inscription, routeur interne). Si un autre handler a déjà appelé
-    //    preventDefault, ou si le lien ouvre dans un nouvel onglet, on laisse faire.
-    if (e.defaultPrevented) return;
+    // Liens qui ouvrent un nouvel onglet ou téléchargent : on laisse le navigateur faire
     if (a.getAttribute('target') === '_blank') return;
     if (a.hasAttribute('download')) return;
-    // 🆕 Si le lien a un rôle bouton ou un handler onclick, c'est du JS applicatif :
-    //    on laisse le site travailler (ex: ouvrir la fenêtre d'inscription Canal+).
-    if (a.getAttribute('role') === 'button' || a.hasAttribute('onclick')) return;
     var absoluteUrl;
     try { absoluteUrl = new URL(href, document.baseURI).href; } catch (err) { return; }
     if (absoluteUrl.indexOf(PROXY_ORIGIN) === 0) return;
@@ -405,7 +399,7 @@ function buildBridgeScript(proxyOrigin, targetHost) {
       a.setAttribute('target', '_blank');
       a.setAttribute('rel', 'noopener noreferrer');
     }
-  }, false);
+  }, true);
 
   // ── Signal "bridge prêt" envoyé au parent (Astrid) ──
   function sendReady() {
@@ -425,7 +419,7 @@ function buildBridgeScript(proxyOrigin, targetHost) {
     var s = String(label);
     if (s.length > 80) s = s.substring(0, 80);
     s = s.replace(/[\u0000-\u001F\u007F]+/g, ' ');
-    s = s.replace(/"/g, '').replace(/'/g, '');
+    s = s.replace(/["`]/g, "'");
     // Détection grossière d'injection — si trouvé on remplace
     var bad = /\b(ignore|disregard|forget)\s+(all|previous|tout)\b|\b(you are now|tu es maintenant|jailbreak)\b|\[INST\]|<\|.+?\|>/i;
     if (bad.test(s)) return '[filtered]';
