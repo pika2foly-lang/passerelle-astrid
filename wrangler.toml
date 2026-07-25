@@ -30,3 +30,6 @@ id = "307e80f3347843109897576fc2e17f19"
 
 # [vars]
 # ASTRID_SHARED_SECRET = "ton-secret-unique-ici"
+
+[triggers]
+crons = ["0 4 * * *"]
