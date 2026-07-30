@@ -29,7 +29,7 @@ export default {
       if (!target) return new Response('Missing ?url=', { status: 400, headers: corsHeaders() });
       const rlCheck = await checkRateLimit(request, env);
       if (!rlCheck.allowed) return rlCheck.response;
-      return await proxyRequest(target, url.origin, request);
+      return await proxyRequest(target, url.origin, request, env);
     }
 
     if (path === '/proxy-asset' || path === '/proxy-asset/') {
@@ -48,6 +48,8 @@ export default {
         worker: 'ohapiday-passerelle-web',
         rateLimit: env.RATELIMIT ? 'enabled' : 'disabled',
         conav: env.CONAV_SESSIONS ? 'enabled' : 'disabled',
+        // Les cookies ne s'activent que sur une Passerelle personnelle
+        cookies: cookiesActifs(env) ? 'enabled (passerelle personnelle)' : 'disabled (mode partage)',
         essaiMinutesParJour: ESSAI_MINUTES_PAR_JOUR,
         time: new Date().toISOString()
       }), {
@@ -283,6 +285,108 @@ function makeRewriter(targetUrl, proxyOrigin, bridgeHtml, helpers) {
 // Avec redirect:'follow', seule l'URL de depart etait verifiee : un site
 // pouvait rediriger vers 169.254.169.254 et contourner toute la protection.
 // Renvoie aussi l'URL FINALE, indispensable pour poser le bon <base href>.
+// ═════════════════════════════════════════════════════════════════════
+//  🍪 POT DE COOKIES — uniquement sur une Passerelle PERSONNELLE
+// ═════════════════════════════════════════════════════════════════════
+//  Sans cookies, aucune demarche en plusieurs pages ne fonctionne :
+//  le site pose une session, ne la retrouve pas, et recharge en boucle.
+//
+//  Trois regles rendent la chose defendable :
+//   1. Le pot vit dans le KV, JAMAIS dans le navigateur. Le JavaScript
+//      d'une page ne peut donc pas lire document.cookie et repartir
+//      avec la session.
+//   2. Un compartiment par hote : les cookies d'ameli.fr ne partent
+//      jamais ailleurs.
+//   3. Ils ne s'attachent qu'aux NAVIGATIONS de page. Une page
+//      malveillante qui ferait fetch('/proxy-web?url=...') envoie
+//      Sec-Fetch-Dest: empty et ne recoit rien : elle obtient une page
+//      deconnectee. C'est ce qui ferme le trou du proxy mono-origine.
+//
+//  Actif seulement si AI_TOKEN est defini : c'est le signal d'une
+//  Passerelle personnelle. Sur le proxy partage, jamais.
+const COOKIES_TTL = 30 * 86400;
+
+function cookiesActifs(env) {
+  return !!(env && env.AI_TOKEN && env.GALAXY);
+}
+
+// Une vraie navigation de page, pas un appel JavaScript depuis la page
+function estNavigation(request) {
+  const dest = request.headers.get('Sec-Fetch-Dest');
+  if (dest) return dest === 'document' || dest === 'iframe' || dest === 'frame';
+  // Navigateur ancien sans Sec-Fetch-* : on se rabat sur Accept
+  const acc = request.headers.get('Accept') || '';
+  return acc.indexOf('text/html') !== -1;
+}
+
+async function lirePot(env, hote) {
+  try {
+    const brut = await env.GALAXY.get('v1:jar:' + hote);
+    return brut ? JSON.parse(brut) : {};
+  } catch (e) { return {}; }
+}
+
+async function ecrirePot(env, hote, pot) {
+  try {
+    await env.GALAXY.put('v1:jar:' + hote, JSON.stringify(pot), { expirationTtl: COOKIES_TTL });
+  } catch (e) { /* le pot est un confort, jamais bloquant */ }
+}
+
+// Le domaine qui possede le cookie : ameli.fr couvre www.ameli.fr
+function hotePot(host) {
+  return domaineRacine(String(host).toLowerCase());
+}
+
+async function enTeteCookie(env, host) {
+  const pot = await lirePot(env, hotePot(host));
+  const maintenant = Date.now();
+  const paires = [];
+  for (const [nom, c] of Object.entries(pot)) {
+    if (c && c.exp && c.exp < maintenant) continue;   // perime
+    paires.push(nom + '=' + c.v);
+  }
+  return paires.join('; ');
+}
+
+async function absorberCookies(env, host, reponse) {
+  let liste = [];
+  try {
+    if (typeof reponse.headers.getSetCookie === 'function') liste = reponse.headers.getSetCookie();
+    else if (typeof reponse.headers.getAll === 'function')  liste = reponse.headers.getAll('Set-Cookie');
+    else { const un = reponse.headers.get('Set-Cookie'); if (un) liste = [un]; }
+  } catch (e) { return; }
+  if (!liste || !liste.length) return;
+
+  const hote = hotePot(host);
+  const pot = await lirePot(env, hote);
+  let touche = false;
+
+  for (const brut of liste) {
+    const parts = String(brut).split(';');
+    const premier = parts[0].trim();
+    const eq = premier.indexOf('=');
+    if (eq < 1) continue;
+    const nom = premier.slice(0, eq).trim();
+    const val = premier.slice(eq + 1);
+
+    let exp = 0;
+    for (let i = 1; i < parts.length; i++) {
+      const a = parts[i].trim().toLowerCase();
+      if (a.startsWith('max-age=')) {
+        const sec = parseInt(a.slice(8), 10);
+        if (!isNaN(sec)) exp = sec <= 0 ? -1 : Date.now() + sec * 1000;
+      } else if (a.startsWith('expires=')) {
+        const t = Date.parse(parts[i].trim().slice(8));
+        if (!isNaN(t)) exp = t;
+      }
+    }
+    if (exp === -1) { delete pot[nom]; touche = true; continue; }   // suppression
+    pot[nom] = { v: val, exp: exp || 0 };
+    touche = true;
+  }
+  if (touche) await ecrirePot(env, hote, pot);
+}
+
 async function fetchSecurise(urlDepart, init, maxSauts = 5) {
   let courante = urlDepart;
   let options  = { ...init, redirect: 'manual' };
@@ -309,7 +413,7 @@ async function fetchSecurise(urlDepart, init, maxSauts = 5) {
   return { erreur: 'Trop de redirections' };
 }
 
-async function proxyRequest(targetUrl, proxyOrigin, originalRequest) {
+async function proxyRequest(targetUrl, proxyOrigin, originalRequest, env) {
   if (targetUrl && targetUrl.toLowerCase().startsWith('http://')) {
     targetUrl = 'https://' + targetUrl.substring(7);
   }
@@ -339,6 +443,15 @@ async function proxyRequest(targetUrl, proxyOrigin, originalRequest) {
       if (ct) init.headers['Content-Type'] = ct;
     }
 
+    // 🍪 On joint les cookies UNIQUEMENT sur une vraie navigation de page,
+    //    et seulement si cette Passerelle est personnelle (AI_TOKEN pose).
+    if (cookiesActifs(env) && estNavigation(originalRequest)) {
+      try {
+        const ck = await enTeteCookie(env, new URL(targetUrl).host);
+        if (ck) init.headers['Cookie'] = ck;
+      } catch (e) {}
+    }
+
     const res = await fetchSecurise(targetUrl, init);
     if (res.erreur) {
       return new Response('🔒 ' + res.erreur, {
@@ -347,6 +460,12 @@ async function proxyRequest(targetUrl, proxyOrigin, originalRequest) {
       });
     }
     const response = res.reponse;
+
+    // On garde ce que le site a pose, pour la page suivante
+    if (cookiesActifs(env)) {
+      try { await absorberCookies(env, new URL(res.urlFinale || targetUrl).host, response); } catch (e) {}
+    }
+
     // L'URL FINALE, pas celle de depart : apres un POST -> 302 -> GET,
     // la page affichee vient d'ailleurs et le <base href> doit la suivre.
     const urlFinale = res.urlFinale || targetUrl;
@@ -2215,198 +2334,4 @@ function featParcours(cfg) {
     var onClick = function(){
       cible.style.outline = '';
       cible.removeEventListener('click', onClick, true);
-      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'replay-advance', label: step.label }, '*'); } catch(e){}
-    };
-    cible.addEventListener('click', onClick, true);
-  }
-
-  window.addEventListener('message', function(ev){
-    var d = ev.data;
-    if (!d || d.source !== 'ohapiday-app') return;
-    if (d.type === 'journey-record') recording = !!d.on;
-    if (d.type === 'replay-step' && d.step) rejouerEtape(d.step);
-  });
-})();`;
-}
-
-// ════════════════════════════════════════════════════════════════
-// 12 — PREUVE AUTOMATIQUE + ÉCHÉANCES (client, injecté)
-// ════════════════════════════════════════════════════════════════
-//
-// Astrid lit chaque page et repère TOUTE SEULE :
-//   - les échéances ("avant le 15 mars", "sous 15 jours")
-//   - les numéros de dossier / références
-//   - les pages de confirmation ("votre demande a bien été prise en compte")
-//
-// Sur une confirmation, elle propose de garder la preuve (texte propre +
-// date + URL) et de créer un rappel tiré du texte même de la page.
-// C'est le pont entre l'écran et la vie réelle — là où ton public décroche.
-//
-// ÉVÉNEMENTS émis vers ton app :
-//   'proof-found'    {kind, action, date, reference, url, capturedAt, snapshot}
-//   'deadline-found' {text, date, url}
-// BRANCHEMENT IA (facultatif, pour fiabiliser l'extraction) :
-//   'proof-analyze-request' {text} -> IA -> 'proof-analyze-response' {action,date,reference}
-// Ton app : stocke la preuve, crée le rappel (calendrier / notification).
-
-function featPreuve(cfg) {
-  return String.raw`(function(){
-  function realUrl(){ try { return new URLSearchParams(location.search).get('url') || document.baseURI; } catch(e){ return document.baseURI; } }
-  function mainText(){
-    var el = document.querySelector('main, article, [role=main], #content, .content') || document.body;
-    return (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
-  }
-
-  var MOIS = 'janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre';
-  var reEcheanceMois = new RegExp('(avant le|jusqu\'au|au plus tard le|d\'ici le)\\s+(\\d{1,2}\\s+(?:' + MOIS + ')(?:\\s+\\d{4})?)', 'i');
-  var reEcheanceNum  = /(avant le|jusqu'au|au plus tard le|d'ici le)\s+(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})/i;
-  var reDelai        = /sous\s+(\d{1,2})\s+(jours|semaines|mois)/i;
-  var reReference    = /(?:dossier|référence|reference|récépissé|recepisse|numéro|numero|n[°o])\s*:?\s*(?:n[°o]\s*)?([A-Z0-9][A-Z0-9\-\/]{3,19})/i;
-  function extraireRef(txt){ var m = reReference.exec(txt); if (!m) return null; var v = m[1].trim(); return /\d/.test(v) ? v : null; }
-  var reConfirm      = /(a bien été (?:pris|prise|enregistr)|votre demande a été|confirmation de|récépissé|recepisse|accusé de réception|accuse de reception|est confirmée|est confirmee|merci.{0,20}votre demande)/i;
-
-  function analyser(){
-    var txt = mainText();
-    if (!txt || txt.length < 40) return;
-
-    // échéances (passif : même sans confirmation)
-    var mEch = reEcheanceMois.exec(txt) || reEcheanceNum.exec(txt);
-    if (mEch){
-      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
-        text: mEch[0], date: mEch[2], url: realUrl() }, '*'); } catch(e){}
-    } else {
-      var mDel = reDelai.exec(txt);
-      if (mDel){
-        try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
-          text: mDel[0], date: null, url: realUrl() }, '*'); } catch(e){}
-      }
-    }
-
-    // page de confirmation -> preuve
-    if (reConfirm.test(txt)){
-      var ref = extraireRef(txt);
-      var snapshot = txt.slice(0, 600);
-      var payload = {
-        kind: 'confirmation',
-        action: (reConfirm.exec(txt)||[])[0] || 'Demande confirmée',
-        date: (mEch ? mEch[2] : null),
-        reference: ref,
-        url: realUrl(),
-        capturedAt: new Date().toISOString(),
-        snapshot: snapshot
-      };
-      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-found', proof: payload }, '*'); } catch(e){}
-      // fiabilisation IA (facultative)
-      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-analyze-request', text: snapshot }, '*'); } catch(e){}
-      banniere();
-    }
-  }
-
-  // petit bandeau proposant de garder la preuve
-  function banniere(){
-    if (document.getElementById('__astrid_preuve__')) return;
-    var box = document.createElement('div');
-    box.id = '__astrid_preuve__';
-    box.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:14px;'
-      + 'z-index:2147483646;background:#065f46;color:#fff;font:700 15px system-ui,sans-serif;'
-      + 'padding:14px 18px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.3);'
-      + 'display:flex;align-items:center;gap:12px;max-width:92vw';
-    var t = document.createElement('span');
-    t.textContent = '✅ Démarche confirmée. Astrid peut garder la preuve.';
-    var b = document.createElement('button');
-    b.textContent = 'Garder la preuve';
-    b.style.cssText = 'background:#FFE8B5;color:#065f46;border:0;border-radius:10px;padding:10px 14px;font:800 15px system-ui;cursor:pointer';
-    b.onclick = function(){
-      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-save-confirmed' }, '*'); } catch(e){}
-      box.remove();
-    };
-    var x = document.createElement('button');
-    x.textContent = '✕';
-    x.style.cssText = 'background:transparent;color:#fff;border:0;font-size:18px;cursor:pointer';
-    x.onclick = function(){ box.remove(); };
-    box.appendChild(t); box.appendChild(b); box.appendChild(x);
-    (document.body||document.documentElement).appendChild(box);
-  }
-
-  function run(){ try { analyser(); } catch(e){} }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
-  else run();
-  setTimeout(run, 2000); // re-scan si la confirmation arrive après coup
-})();`;
-}
-
-// ════════════════════════════════════════════════════════════════
-// 15 — RELAIS VOCAL (client, injecté) — le pendant de 14 dans la page
-// ════════════════════════════════════════════════════════════════
-//
-// Reçoit les ordres du module vocal (14) et agit dans la page :
-//   'voice-point' {voiceId, label, click}  -> trouve, pointe, (clique)
-//   'nav-back'                              -> page précédente
-//   'tts-speak-page'                        -> lit le contenu principal
-//   'explique-mot' {mot}                    -> demande l'explication
-//   'voice-list-elements'                   -> renvoie les libellés cliquables
-// Et signale 'page-ready' au chargement (pour enchaîner les étapes).
-
-function featVoixRelais(cfg) {
-  return String.raw`(function(){
-  function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim(); }
-  function versParent(msg){ try { window.parent.postMessage(Object.assign({ source:'ohapiday-bridge' }, msg), '*'); } catch(e){} }
-
-  function cliquables(){
-    return Array.prototype.slice.call(
-      document.querySelectorAll('a, button, [role=button], input[type=submit], input[type=button]')
-    ).filter(function(el){ return el.offsetParent !== null && (el.innerText || el.value || '').trim(); });
-  }
-
-  function trouver(label){
-    var lab = norm(label), best = -1, cible = null;
-    cliquables().forEach(function(el){
-      var t = norm(el.innerText || el.value);
-      if (!t) return;
-      var score = (t === lab) ? 100 : (t.indexOf(lab) !== -1 ? 70 : (lab.indexOf(t) !== -1 ? 40 : -1));
-      if (score > best){ best = score; cible = el; }
-    });
-    return best >= 40 ? cible : null;
-  }
-
-  function pointer(el, cliquer){
-    try { el.scrollIntoView({ block:'center', behavior:'smooth' }); } catch(e){}
-    el.style.outline = '4px solid #FF6A00';
-    el.style.outlineOffset = '3px';
-    el.style.transition = 'outline-color .3s';
-    var n = 0, iv = setInterval(function(){ el.style.outlineColor = (n++ % 2) ? '#FF6A00' : '#FFD08A'; if (n > 6){ clearInterval(iv); } }, 300);
-    setTimeout(function(){ el.style.outline = ''; }, 2600);
-    if (cliquer){ setTimeout(function(){ try { el.click(); } catch(e){} }, 900); }
-  }
-
-  window.addEventListener('message', function(ev){
-    var d = ev.data;
-    if (!d || d.source !== 'ohapiday-app') return;
-
-    if (d.type === 'voice-point'){
-      var el = trouver(d.label);
-      if (el){ pointer(el, !!d.click); versParent({ type:'voice-found', voiceId:d.voiceId }); }
-      else   { versParent({ type:'voice-miss',  voiceId:d.voiceId }); }
-    }
-    else if (d.type === 'nav-back'){ try { history.back(); } catch(e){} }
-    else if (d.type === 'tts-speak-page'){
-      var main = document.querySelector('main, article, [role=main], #content, .content') || document.body;
-      var txt = (main.innerText || '').replace(/\s+/g,' ').trim().slice(0, 9000);
-      try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: txt }, '*'); } catch(e){}
-    }
-    else if (d.type === 'explique-mot'){
-      versParent({ type:'explique-request', word: d.mot, context: '' });
-    }
-    else if (d.type === 'voice-list-elements'){
-      var labels = cliquables().map(function(el){ return (el.innerText || el.value || '').trim().slice(0, 50); })
-        .filter(Boolean).slice(0, 60);
-      versParent({ type:'voice-elements', elements: labels });
-    }
-  });
-
-  // signale que la page est prête (pour enchaîner "va sur X puis...")
-  function pret(){ versParent({ type:'page-ready', url: (function(){ try { return new URLSearchParams(location.search).get('url') || location.href; } catch(e){ return location.href; } })() }); }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', pret);
-  else pret();
-})();`;
-}
+      try { window.parent.postMe
