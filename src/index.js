@@ -46,7 +46,7 @@ export default {
       return new Response(JSON.stringify({
         ok: true,
         worker: 'ohapiday-passerelle-web',
-        rateLimit: env.RATELIMIT ? 'enabled' : 'disabled',
+        rateLimit: env.RATELIMIT ? 'enabled' : 'MANQUANT — le proxy refuse tout',
         conav: env.CONAV_SESSIONS ? 'enabled' : 'disabled',
         // Les cookies ne s'activent que sur une Passerelle personnelle
         cookies: cookiesActifs(env) ? 'enabled (passerelle personnelle)' : 'disabled (mode partage)',
@@ -98,7 +98,9 @@ export default {
 };
 
 async function checkRateLimit(request, env) {
-  if (!env.RATELIMIT) return { allowed: true };
+  // Binding absent : on bloque aussi. Sinon un oubli de configuration
+  // ouvrirait le proxy en grand sans que personne ne s'en apercoive.
+  if (!env.RATELIMIT) return { allowed: false, response: reponseIndisponible() };
 
   const ip      = request.headers.get('cf-connecting-ip') || 'unknown';
   const jour    = new Date().toISOString().slice(0, 10);
@@ -127,16 +129,30 @@ async function checkRateLimit(request, env) {
     return { allowed: true, tranchesUtilisees: tranches.length };
 
   } catch (e) {
-    // Filet : si KV echoue, on n'empeche jamais quelqu'un de naviguer.
+    // KV en echec : on BLOQUE. Laisser passer ferait disparaitre la limite
+    // en silence au moment ou la charge la rend le plus necessaire.
     console.error('Rate limit:', e);
-    return { allowed: true };
+    return { allowed: false, response: reponseIndisponible() };
   }
+}
+
+// KV injoignable : ce n'est pas la faute de l'utilisateur, on le dit.
+function reponseIndisponible() {
+  return new Response(JSON.stringify({
+    error: 'service_indisponible',
+    message: "Le service d'essai est momentanement indisponible. Reessaie dans quelques minutes, "
+           + "ou depose ta propre Passerelle : elle n'a aucune limite et se met en place en 5 minutes.",
+    tutorial: TUTORIEL_URL
+  }), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Retry-After': '120', ...corsHeaders() }
+  });
 }
 
 function reponseEssaiTermine(utilisees, resetIn) {
   return new Response(JSON.stringify({
     error: 'essai_termine',
-    message: "Tu as utilise tes " + ESSAI_MINUTES_PAR_JOUR + " minutes d'essai du jour. "
+    message: "Tu as atteint la limite d'essai du jour. "
            + "Ta propre Passerelle n'a aucune limite, elle est gratuite et se depose en 5 minutes.",
     minutesParJour: ESSAI_MINUTES_PAR_JOUR,
     tranchesUtilisees: utilisees,
@@ -755,8 +771,18 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
     if (!label) return '';
     var s = String(label);
     if (s.length > 80) s = s.substring(0, 80);
-    s = s.replace(/[\u0000-\u001F\u007F]+/g, ' ');
-    s = s.replace(/["\u0060]/g, "'");
+    // Pas de sequence Unicode echappee dans un template literal : elle est
+    // interpretee trop tot et produit une regex INVALIDE, ce qui empechait
+    // TOUT le bridge de demarrer (donc aucun pointage).
+    var propre = '';
+    for (var ci = 0; ci < s.length; ci++) {
+      var cc = s.charCodeAt(ci);
+      propre += (cc < 32 || cc === 127) ? ' ' : s.charAt(ci);
+    }
+    s = propre;
+    // Sequence Unicode echappee INTERPRETEE par le template literal : le
+    // backtick reel se retrouvait dans la sortie et fermait le template.
+    s = s.split('"').join("'").split(String.fromCharCode(96)).join("'");
     var bad = /\\b(ignore|disregard|forget)\\s+(all|previous|tout)\\b|\\b(you are now|tu es maintenant|jailbreak)\\b|\\[INST\\]|<\\|.+?\\|>/i;
     if (bad.test(s)) return '[filtered]';
     return s.replace(/\\s+/g, ' ').trim();
@@ -943,83 +969,215 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
       }
     }
   }
-  function highlightElement(selector, label, safeBottom, largeMode) {
-    var existing = document.getElementById(HIGHLIGHT_ID);
-    if (existing) existing.remove();
-    var el;
-    try { el = document.querySelector(selector); } catch (e) { return false; }
-    if (!el) return false;
-    safeBottom = parseInt(safeBottom) || 0;
-    var visibleHeight = window.innerHeight - safeBottom;
-    if (visibleHeight < 200) visibleHeight = window.innerHeight;
-    var targetY = Math.max(80, visibleHeight * 0.35);
-    var rect = el.getBoundingClientRect();
-    var scrollDelta = rect.top - targetY;
+  // ═══════════════════════════════════════════════════════════════
+  //  POINTAGE — rendu IDENTIQUE a window.astridPoint de l'application
+  // ═══════════════════════════════════════════════════════════════
+  //  TROIS couches superposees, pas une :
+  //   1. .astrid-pointed       outline orange SUR la cible, epouse sa forme
+  //   2. .astrid-point-circle  le ROND qui l'entoure, halo pulsant
+  //   3. .astrid-point-arrow   le doigt qui rebondit AU-DESSUS + la bulle
+  //  Avant : un seul cadre, avec un doigt a l'envers DANS la bulle.
+  var PT_OVERLAY = 'astrid-point-overlay';
+  var ptCible = null, ptTimerMaj = null, ptTimerFin = null;
+  // Ce qu'on montre en ce moment. Sert a savoir si la personne a clique
+  // AILLEURS : sans cela, la sequence avancait meme apres un mauvais clic,
+  // et on se retrouvait perdu a trois pages de profondeur sans le savoir.
+  var ptAttendu = null;   // { el, selector, label }
+  // L'ecouteur de clic doit etre RETIRE quand le pointage s'arrete.
+  // Sinon pointer deux fois le meme bouton attache deux ecouteurs, et un
+  // seul clic envoie deux 'target-clicked' : la sequence saute une etape.
+  var ptEcouteur = null, ptElEcoute = null;
+
+  function ptCss(){
+    if (document.getElementById('astrid-point-styles')) return;
+    var st = document.createElement('style');
+    st.id = 'astrid-point-styles';
+    st.textContent = [
+      '#astrid-point-overlay{position:fixed;pointer-events:none;z-index:2147483646;opacity:0;transition:opacity .3s ease}',
+      '.astrid-point-circle{position:absolute;inset:0;border-radius:50%;border:4px solid #FF9500;',
+      '  box-shadow:0 0 0 4px rgba(255,149,0,0.25),0 0 28px rgba(255,149,0,0.65),inset 0 0 14px rgba(255,149,0,0.20);',
+      '  background:rgba(255,149,0,0.05);animation:astridPointPulse 1.6s ease-in-out infinite}',
+      '.astrid-point-arrow{position:absolute;top:-44px;left:50%;transform:translateX(-50%);font-size:30px;',
+      '  animation:astridArrowBounce .8s ease-in-out infinite alternate;',
+      '  filter:drop-shadow(0 2px 6px rgba(255,149,0,0.7))}',
+      '.astrid-point-label{position:absolute;top:calc(100% + 14px);left:50%;transform:translateX(-50%);',
+      '  background:linear-gradient(135deg,#2a1a00,#1a0e2e);color:#FFD93D;padding:9px 15px;border-radius:11px;',
+      '  font-size:12px;font-weight:700;white-space:nowrap;max-width:280px;text-overflow:ellipsis;overflow:hidden;',
+      '  box-shadow:0 8px 24px rgba(0,0,0,0.5);letter-spacing:.01em;line-height:1.45;pointer-events:none;',
+      '  border:1px solid rgba(255,182,39,0.55);animation:astridLabelIn .35s cubic-bezier(.16,1,.3,1)}',
+      '.astrid-point-label::before{content:"";position:absolute;top:-7px;left:50%;transform:translateX(-50%);',
+      '  border:7px solid transparent;border-bottom-color:#2a1a00;border-top:none}',
+      '@keyframes astridPointPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.12);opacity:.85}}',
+      '@keyframes astridArrowBounce{from{transform:translateX(-50%) translateY(0)}to{transform:translateX(-50%) translateY(10px)}}',
+      '@keyframes astridLabelIn{from{opacity:0;transform:translateX(-50%) translateY(-6px) scale(.9)}',
+      '  to{opacity:1;transform:translateX(-50%) translateY(0) scale(1)}}',
+      '.astrid-pointed{position:relative;z-index:2147483645 !important;overflow:visible !important;',
+      '  outline:3px solid #FF9500 !important;outline-offset:3px !important;scroll-margin:120px;',
+      '  animation:astridPointedPulse 1.4s ease-in-out infinite !important}',
+      '@keyframes astridPointedPulse{',
+      '  0%,100%{box-shadow:0 0 0 0 rgba(255,149,0,0.6),0 0 28px 6px rgba(255,149,0,0.55),0 0 0 3px rgba(255,149,0,0.85) !important}',
+      '  50%{box-shadow:0 0 0 8px rgba(255,149,0,0.15),0 0 36px 10px rgba(255,149,0,0.75),0 0 0 3px rgba(255,149,0,1) !important}}',
+      '.astrid-pointed-parent-fix{overflow:visible !important}'
+    ].join(String.fromCharCode(10));
+    document.head.appendChild(st);
+  }
+
+  function ptCacher(){
+    if (ptTimerMaj){ clearInterval(ptTimerMaj); ptTimerMaj = null; }
+    if (ptTimerFin){ clearTimeout(ptTimerFin); ptTimerFin = null; }
+    ptCible = null;
+    ptAttendu = null;
+    if (ptElEcoute && ptEcouteur) {
+      try { ptElEcoute.removeEventListener('click', ptEcouteur); } catch (e) {}
+    }
+    ptEcouteur = null; ptElEcoute = null;
+    document.querySelectorAll('.astrid-pointed, .astrid-pointed-parent-fix').forEach(function(n){
+      n.classList.remove('astrid-pointed');
+      n.classList.remove('astrid-pointed-parent-fix');
+    });
+    [PT_OVERLAY, HIGHLIGHT_ID].forEach(function(id){
+      var n = document.getElementById(id);
+      if (n && n.parentNode) n.parentNode.removeChild(n);
+    });
+  }
+
+  function ptOverlay(){
+    var ov = document.getElementById(PT_OVERLAY);
+    if (ov) return ov;
+    ov = document.createElement('div');
+    ov.id = PT_OVERLAY;
+    ov.innerHTML = '<div class="astrid-point-arrow">👇</div>'
+                 + '<div class="astrid-point-circle"></div>'
+                 + '<div class="astrid-point-label"></div>';
+    document.body.appendChild(ov);
+    return ov;
+  }
+
+  function ptMaj(ov){
+    if (!ov || !ptCible || !ptCible.isConnected){ ptCacher(); return; }
+    var rect = ptCible.getBoundingClientRect();
+    var large = rect.width > 200, haute = rect.height > 200;
+    var taille, cx, cy;
+    if (large || haute){
+      taille = 64;
+      cx = rect.left + Math.min(rect.width, 100) / 2 + (large ? 20 : 0);
+      cy = rect.top + Math.min(rect.height, 64) / 2 + (haute ? 12 : 0);
+    } else {
+      taille = Math.max(50, Math.max(rect.width, rect.height) + 14);
+      cx = rect.left + rect.width / 2;
+      cy = rect.top + rect.height / 2;
+    }
+    ov.style.left   = (cx - taille / 2) + 'px';
+    ov.style.top    = (cy - taille / 2) + 'px';
+    ov.style.width  = taille + 'px';
+    ov.style.height = taille + 'px';
+    var visible = rect.bottom > 0 && rect.top < window.innerHeight
+               && rect.right > 0 && rect.left < window.innerWidth;
+    ov.style.opacity = visible ? '1' : '0';
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  CLIC HORS CIBLE — on previent l'app AVANT qu'elle n'avance
+  // ═══════════════════════════════════════════════════════════════
+  //  Sans cela, un clic a cote faisait avancer la sequence quand meme :
+  //  la personne se retrouvait trois pages plus loin, au mauvais endroit,
+  //  sans que rien ne le signale. Elle croit avoir mal fait, elle ferme.
+  //
+  //  On observe en phase de capture pour passer AVANT les gestionnaires
+  //  de la page, et on ne bloque jamais le clic : on rapporte, c'est tout.
+  document.addEventListener('click', function(ev){
+    if (!ptAttendu || !ptAttendu.el) return;
+
+    // Clic sur la cible, ou sur un enfant de la cible (icone, span…) : c'est bon.
+    var n = ev.target;
+    while (n) {
+      if (n === ptAttendu.el) return;
+      n = n.parentElement;
+    }
+
+    // Clic ailleurs : que decrire ? On remonte au premier element cliquable
+    // pour donner un libelle utile a Astrid, pas un <span> anonyme.
+    var cliquable = ev.target, prof = 0;
+    while (cliquable && prof < 6) {
+      var tg = cliquable.tagName;
+      if (tg === 'A' || tg === 'BUTTON' ||
+          cliquable.getAttribute && cliquable.getAttribute('role') === 'button' ||
+          (tg === 'INPUT' && /submit|button/i.test(cliquable.type || ''))) break;
+      cliquable = cliquable.parentElement; prof++;
+    }
+    var quoi = cliquable || ev.target;
+    var texte = '';
     try {
-      if (Math.abs(scrollDelta) > 20) {
-        window.scrollBy({ top: scrollDelta, behavior: 'smooth' });
+      texte = (quoi.innerText || quoi.value || quoi.getAttribute('aria-label') ||
+               quoi.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    } catch (e) {}
+
+    try {
+      window.parent.postMessage({
+        source: 'ohapiday-bridge',
+        type: 'clic-hors-cible',
+        attendu: ptAttendu.label,
+        attenduSelector: ptAttendu.selector,
+        clique: texte,
+        cliqueTag: (quoi.tagName || '').toLowerCase()
+      }, '*');
+    } catch (e) {}
+  }, true);
+
+  function highlightElement(selector, label, safeBottom, largeMode) {
+    var el;
+    try { el = (typeof selector === 'string') ? document.querySelector(selector) : selector; }
+    catch (e) { return false; }
+    if (!el) return false;
+
+    ptCss();
+    ptCacher();
+    ptCible = el;
+    ptAttendu = {
+      el: el,
+      selector: (typeof selector === 'string') ? selector : '',
+      label: label || ''
+    };
+    el.classList.add('astrid-pointed');
+
+    // Les parents en overflow:hidden coupent le halo — on les ouvre,
+    // jusqu'a 10 niveaux comme dans l'application.
+    var parent = el.parentElement, prof = 0;
+    while (parent && prof < 10){
+      var cs = window.getComputedStyle(parent);
+      if (cs.overflow === 'hidden' || cs.overflowX === 'hidden' || cs.overflowY === 'hidden'){
+        parent.classList.add('astrid-pointed-parent-fix');
       }
-    } catch (e) {
-      try { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch(_) {}
+      parent = parent.parentElement; prof++;
     }
-    var BORDER_W   = largeMode ? '6px' : '5px';
-    var INSET      = largeMode ? '-10px' : '-6px';
-    var BORDER_RAD = largeMode ? '14px' : '10px';
-    var SHADOW_BASE = largeMode
-      ? '0 0 0 8px rgba(255,106,0,0.45),0 0 44px 10px rgba(255,140,0,0.95),0 0 80px 20px rgba(255,90,0,0.6)'
-      : '0 0 0 5px rgba(255,106,0,0.45),0 0 36px 8px rgba(255,140,0,0.95),0 0 64px 16px rgba(255,90,0,0.55)';
-    var LABEL_FONT  = largeMode ? '16px' : '12px';
-    var LABEL_PAD   = largeMode ? '11px 18px' : '7px 12px';
-    var LABEL_RAD   = largeMode ? '12px' : '9px';
-    var LABEL_MAXW  = largeMode ? '320px' : '240px';
-    var overlay = document.createElement('div');
-    overlay.id = HIGHLIGHT_ID;
-    overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483647;transition:transform .2s ease;';
-    overlay.innerHTML = (
-      '<div style="position:absolute;inset:' + INSET + ';border:' + BORDER_W + ' solid #FF6A00;border-radius:' + BORDER_RAD + ';' +
-      'box-shadow:' + SHADOW_BASE + ';' +
-      'animation:oapiHighlightPulse 1.4s ease-in-out infinite"></div>' +
-      (label ? ('<div style="position:absolute;left:50%;transform:translateX(-50%);top:100%;margin-top:' + (largeMode ? '18px' : '14px') + ';' +
-      'background:#1F1135;color:#FFE8B5;padding:' + LABEL_PAD + ';border-radius:' + LABEL_RAD + ';font-size:' + LABEL_FONT + ';font-weight:' + (largeMode ? '800' : '700') + ';' +
-      'font-family:system-ui,sans-serif;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,0.3);' +
-      'max-width:' + LABEL_MAXW + ';overflow:hidden;text-overflow:ellipsis">👆 ' +
-      String(label).replace(/</g, '&lt;') + '</div>') : '')
-    );
-    if (!document.getElementById('oapi-highlight-style')) {
-      var st = document.createElement('style');
-      st.id = 'oapi-highlight-style';
-      st.textContent = '@keyframes oapiHighlightPulse{0%,100%{box-shadow:0 0 0 5px rgba(255,106,0,0.45),0 0 36px 8px rgba(255,140,0,0.95),0 0 64px 16px rgba(255,90,0,0.55)}50%{box-shadow:0 0 0 10px rgba(255,106,0,0.3),0 0 48px 14px rgba(255,150,0,1),0 0 90px 26px rgba(255,90,0,0.7)}}';
-      document.head.appendChild(st);
+
+    var ov = ptOverlay();
+    var lab = ov.querySelector('.astrid-point-label');
+    if (lab){
+      lab.textContent = label || '';
+      lab.style.display = label ? '' : 'none';
     }
-    document.body.appendChild(overlay);
-    var startTs = Date.now();
-    function reposition() {
-      if (Date.now() - startTs > 12000) {
-        if (overlay.parentNode) overlay.remove();
-        return;
-      }
-      if (!overlay.parentNode || !el.isConnected) return;
-      var r = el.getBoundingClientRect();
-      overlay.style.left = r.left + 'px';
-      overlay.style.top = r.top + 'px';
-      overlay.style.width = r.width + 'px';
-      overlay.style.height = r.height + 'px';
-      requestAnimationFrame(reposition);
-    }
-    reposition();
+
+    try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+    setTimeout(function(){ ptMaj(ov); ov.style.opacity = '1'; }, 500);
+    ptTimerMaj = setInterval(function(){ ptMaj(ov); }, 120);
+
     function onClickTarget() {
-      if (overlay.parentNode) overlay.remove();
+      ptCacher();
       el.removeEventListener('click', onClickTarget);
       try {
         window.parent.postMessage({
           source: 'ohapiday-bridge',
           type: 'target-clicked',
-          selector: selector,
+          selector: (typeof selector === 'string') ? selector : '',
           label: label || ''
         }, '*');
       } catch (e) {}
     }
+    ptEcouteur = onClickTarget; ptElEcoute = el;
     el.addEventListener('click', onClickTarget);
+
+    ptTimerFin = setTimeout(ptCacher, 12000);
     return true;
   }
   window.addEventListener('message', function(ev) {
@@ -2334,4 +2492,383 @@ function featParcours(cfg) {
     var onClick = function(){
       cible.style.outline = '';
       cible.removeEventListener('click', onClick, true);
-      try { window.parent.postMe
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'replay-advance', label: step.label }, '*'); } catch(e){}
+    };
+    cible.addEventListener('click', onClick, true);
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app') return;
+    if (d.type === 'journey-record') recording = !!d.on;
+    if (d.type === 'replay-step' && d.step) rejouerEtape(d.step);
+  });
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 12 — PREUVE AUTOMATIQUE + ÉCHÉANCES (client, injecté)
+// ════════════════════════════════════════════════════════════════
+//
+// Astrid lit chaque page et repère TOUTE SEULE :
+//   - les échéances ("avant le 15 mars", "sous 15 jours")
+//   - les numéros de dossier / références
+//   - les pages de confirmation ("votre demande a bien été prise en compte")
+//
+// Sur une confirmation, elle propose de garder la preuve (texte propre +
+// date + URL) et de créer un rappel tiré du texte même de la page.
+// C'est le pont entre l'écran et la vie réelle — là où ton public décroche.
+//
+// ÉVÉNEMENTS émis vers ton app :
+//   'proof-found'    {kind, action, date, reference, url, capturedAt, snapshot}
+//   'deadline-found' {text, date, url}
+// BRANCHEMENT IA (facultatif, pour fiabiliser l'extraction) :
+//   'proof-analyze-request' {text} -> IA -> 'proof-analyze-response' {action,date,reference}
+// Ton app : stocke la preuve, crée le rappel (calendrier / notification).
+
+function featPreuve(cfg) {
+  return String.raw`(function(){
+  function realUrl(){ try { return new URLSearchParams(location.search).get('url') || document.baseURI; } catch(e){ return document.baseURI; } }
+  function mainText(){
+    var el = document.querySelector('main, article, [role=main], #content, .content') || document.body;
+    return (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
+  }
+
+  var MOIS = 'janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre';
+  var reEcheanceMois = new RegExp('(avant le|jusqu\'au|au plus tard le|d\'ici le)\\s+(\\d{1,2}\\s+(?:' + MOIS + ')(?:\\s+\\d{4})?)', 'i');
+  var reEcheanceNum  = /(avant le|jusqu'au|au plus tard le|d'ici le)\s+(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})/i;
+  var reDelai        = /sous\s+(\d{1,2})\s+(jours|semaines|mois)/i;
+  var reReference    = /(?:dossier|référence|reference|récépissé|recepisse|numéro|numero|n[°o])\s*:?\s*(?:n[°o]\s*)?([A-Z0-9][A-Z0-9\-\/]{3,19})/i;
+  function extraireRef(txt){ var m = reReference.exec(txt); if (!m) return null; var v = m[1].trim(); return /\d/.test(v) ? v : null; }
+  var reConfirm      = /(a bien été (?:pris|prise|enregistr)|votre demande a été|confirmation de|récépissé|recepisse|accusé de réception|accuse de reception|est confirmée|est confirmee|merci.{0,20}votre demande)/i;
+
+  function analyser(){
+    var txt = mainText();
+    if (!txt || txt.length < 40) return;
+
+    // échéances (passif : même sans confirmation)
+    var mEch = reEcheanceMois.exec(txt) || reEcheanceNum.exec(txt);
+    if (mEch){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
+        text: mEch[0], date: mEch[2], url: realUrl() }, '*'); } catch(e){}
+    } else {
+      var mDel = reDelai.exec(txt);
+      if (mDel){
+        try { window.parent.postMessage({ source:'ohapiday-bridge', type:'deadline-found',
+          text: mDel[0], date: null, url: realUrl() }, '*'); } catch(e){}
+      }
+    }
+
+    // page de confirmation -> preuve
+    if (reConfirm.test(txt)){
+      var ref = extraireRef(txt);
+      var snapshot = txt.slice(0, 600);
+      var payload = {
+        kind: 'confirmation',
+        action: (reConfirm.exec(txt)||[])[0] || 'Demande confirmée',
+        date: (mEch ? mEch[2] : null),
+        reference: ref,
+        url: realUrl(),
+        capturedAt: new Date().toISOString(),
+        snapshot: snapshot
+      };
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-found', proof: payload }, '*'); } catch(e){}
+      // fiabilisation IA (facultative)
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-analyze-request', text: snapshot }, '*'); } catch(e){}
+      banniere();
+    }
+  }
+
+  // petit bandeau proposant de garder la preuve
+  function banniere(){
+    if (document.getElementById('__astrid_preuve__')) return;
+    var box = document.createElement('div');
+    box.id = '__astrid_preuve__';
+    box.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:14px;'
+      + 'z-index:2147483646;background:#065f46;color:#fff;font:700 15px system-ui,sans-serif;'
+      + 'padding:14px 18px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.3);'
+      + 'display:flex;align-items:center;gap:12px;max-width:92vw';
+    var t = document.createElement('span');
+    t.textContent = '✅ Démarche confirmée. Astrid peut garder la preuve.';
+    var b = document.createElement('button');
+    b.textContent = 'Garder la preuve';
+    b.style.cssText = 'background:#FFE8B5;color:#065f46;border:0;border-radius:10px;padding:10px 14px;font:800 15px system-ui;cursor:pointer';
+    b.onclick = function(){
+      try { window.parent.postMessage({ source:'ohapiday-bridge', type:'proof-save-confirmed' }, '*'); } catch(e){}
+      box.remove();
+    };
+    var x = document.createElement('button');
+    x.textContent = '✕';
+    x.style.cssText = 'background:transparent;color:#fff;border:0;font-size:18px;cursor:pointer';
+    x.onclick = function(){ box.remove(); };
+    box.appendChild(t); box.appendChild(b); box.appendChild(x);
+    (document.body||document.documentElement).appendChild(box);
+  }
+
+  function run(){ try { analyser(); } catch(e){} }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+  else run();
+  setTimeout(run, 2000); // re-scan si la confirmation arrive après coup
+})();`;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 15 — RELAIS VOCAL (client, injecté) — le pendant de 14 dans la page
+// ════════════════════════════════════════════════════════════════
+//
+// Reçoit les ordres du module vocal (14) et agit dans la page :
+//   'voice-point' {voiceId, label, click}  -> trouve, pointe, (clique)
+//   'nav-back'                              -> page précédente
+//   'tts-speak-page'                        -> lit le contenu principal
+//   'explique-mot' {mot}                    -> demande l'explication
+//   'voice-list-elements'                   -> renvoie les libellés cliquables
+// Et signale 'page-ready' au chargement (pour enchaîner les étapes).
+
+function featVoixRelais(cfg) {
+  return String.raw`(function(){
+  function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim(); }
+  function versParent(msg){ try { window.parent.postMessage(Object.assign({ source:'ohapiday-bridge' }, msg), '*'); } catch(e){} }
+
+  // Elements que l'on peut montrer ou activer.
+  // L'ancienne version ne prenait que a/button/role=button : elle ratait
+  // les champs de formulaire, les onglets, les elements custom, et
+  // surtout tout ce qui est en position:fixed (offsetParent vaut null
+  // pour eux, alors qu'ils sont parfaitement visibles).
+  function estVisible(el){
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var cs = window.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    if (parseFloat(cs.opacity) === 0) return false;
+    return true;
+  }
+
+  function libelleDe(el){
+    // On CUMULE toutes les sources au lieu de prendre la premiere :
+    //  - un bouton icone a innerText = "🔍" (non vide) et le vrai
+    //    libelle dans aria-label ;
+    //  - un <select> a innerText = le texte des options, et son nom
+    //    dans l'attribut name ou dans un <label for>.
+    // Prendre la premiere source non vide ratait ces deux cas.
+    var bouts = [];
+    var tag = (el.tagName || '').toLowerCase();
+
+    // Les champs de formulaire : leur propre texte n'est pas leur libelle
+    if (tag !== 'select' && tag !== 'textarea' && tag !== 'input') {
+      bouts.push(el.innerText || '');
+    }
+    ['aria-label','title','alt','name','placeholder'].forEach(function(a){
+      var v = el.getAttribute && el.getAttribute(a);
+      if (v) bouts.push(v);
+    });
+    if (el.value && tag === 'input') bouts.push(el.value);
+
+    // Un <label for="..."> qui designe cet element
+    if (el.id) {
+      try {
+        var lb = document.querySelector('label[for="' + el.id + '"]');
+        if (lb && lb.innerText) bouts.push(lb.innerText);
+      } catch(e){}
+    }
+    // Le label qui l'englobe
+    var par = el.closest && el.closest('label');
+    if (par && par.innerText) bouts.push(par.innerText);
+
+    var vus = [];
+    return bouts.map(function(b){ return String(b).replace(/\s+/g,' ').trim(); })
+                .filter(function(b){ if (!b || vus.indexOf(b) !== -1) return false; vus.push(b); return true; })
+                .join(' · ')
+                .slice(0, 200);
+  }
+
+  function cliquables(){
+    var sel = 'a[href], button, [role=button], [role=link], [role=menuitem], [role=tab],'
+            + ' input[type=submit], input[type=button], input[type=radio], input[type=checkbox],'
+            + ' input[type=text], input[type=email], input[type=tel], input[type=password],'
+            + ' input[type=number], input[type=date], input[type=search],'
+            + ' select, textarea, summary, label[for], [onclick], [tabindex]:not([tabindex="-1"])';
+    var vus = [];
+    var out = [];
+    Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(function(el){
+      if (vus.indexOf(el) !== -1) return;
+      vus.push(el);
+      if (!estVisible(el)) return;
+      if (!libelleDe(el)) return;
+      out.push(el);
+    });
+    return out;
+  }
+
+  // Recherche par mots : « déclarer mes revenus » doit trouver « Déclarer ».
+  // L'ancienne version n'acceptait qu'une inclusion exacte dans un sens ou
+  // dans l'autre — elle echouait des que la phrase dictee etait plus riche
+  // que le libelle, ce qui est le cas normal a l'oral.
+  var MOTS_VIDES = ['le','la','les','un','une','des','de','du','sur','au','aux',
+                    'mon','ma','mes','ton','ta','tes','ce','cet','cette','et',
+                    'bouton','lien','case','champ','onglet','clique','cliquer',
+                    'montre','montrer','appuie','appuyer','va','aller'];
+
+  function motsUtiles(t){
+    return norm(t).split(' ').filter(function(m){
+      return m.length > 2 && MOTS_VIDES.indexOf(m) === -1;
+    });
+  }
+
+  function trouver(label){
+    var lab = norm(label);
+    if (!lab) return null;
+    var motsDits = motsUtiles(label);
+    var best = -1, cible = null;
+
+    cliquables().forEach(function(el){
+      var brut = libelleDe(el);
+      var t = norm(brut);
+      if (!t) return;
+
+      var score = -1;
+      if (t === lab)                       score = 100;   // identique
+      else if (t.indexOf(lab) !== -1)      score = 85;    // le libelle contient la phrase
+      else if (lab.indexOf(t) !== -1 && t.length > 2) score = 75;  // la phrase contient le libelle
+      else if (motsDits.length) {
+        // combien des mots dits se retrouvent dans le libelle ?
+        var motsEl = motsUtiles(brut);
+        var communs = 0;
+        motsDits.forEach(function(m){
+          for (var i = 0; i < motsEl.length; i++){
+            if (motsEl[i] === m || motsEl[i].indexOf(m) === 0 || m.indexOf(motsEl[i]) === 0){ communs++; break; }
+          }
+        });
+        if (communs) score = Math.round(40 + 30 * (communs / motsDits.length));
+      }
+      if (score < 0) return;
+
+      // A egalite, on prefere ce qui est deja a l'ecran
+      var r = el.getBoundingClientRect();
+      if (r.top >= 0 && r.bottom <= window.innerHeight) score += 3;
+
+      if (score > best){ best = score; cible = el; }
+    });
+
+    return best >= 55 ? cible : null;
+  }
+
+  function pointer(el, cliquer){
+    try { el.scrollIntoView({ block:'center', behavior:'smooth' }); } catch(e){}
+    el.style.outline = '4px solid #FF6A00';
+    el.style.outlineOffset = '3px';
+    el.style.transition = 'outline-color .3s';
+    var n = 0, iv = setInterval(function(){ el.style.outlineColor = (n++ % 2) ? '#FF6A00' : '#FFD08A'; if (n > 6){ clearInterval(iv); } }, 300);
+    setTimeout(function(){ el.style.outline = ''; }, 2600);
+    if (cliquer){ setTimeout(function(){ try { el.click(); } catch(e){} }, 900); }
+  }
+
+  var __resolvePending = {};
+  function labelsCliquables(){
+    // libelleDe() cumule texte, aria-label, title, name, placeholder et
+    // <label for>. innerText seul ratait tous les boutons-icones et les
+    // champs de formulaire : l'IA ne voyait qu'une partie de la page.
+    return cliquables().map(function(el){ return libelleDe(el).slice(0, 50); })
+      .filter(Boolean).slice(0, 60);
+  }
+
+  function imagesCliquables(){
+    var out = [];
+    var imgs = document.querySelectorAll('img[src]');
+    for (var i = 0; i < imgs.length && out.length < 6; i++){
+      var img = imgs[i];
+      var r = img.getBoundingClientRect();
+      if (r.width < 20 || r.height < 12) continue;           // ignore pixels/icônes minuscules
+      var src = img.currentSrc || img.src || '';
+      if (!src || src.indexOf('data:') === 0) continue;       // pas les data-URI (souvent illisibles)
+      var clic = img.closest('a, button, [role="button"], [onclick]');
+      var cs = window.getComputedStyle(img);
+      if (!clic && cs.cursor !== 'pointer') continue;         // seulement si cliquable
+      var cible = clic || img;
+      var id = 'ocrimg-' + Date.now().toString(36) + '-' + out.length;
+      cible.setAttribute('data-nav-id', id);
+      out.push({ id: id, src: src });
+    }
+    return out;
+  }
+
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d || d.source !== 'ohapiday-app') return;
+
+    if (d.type === 'voice-point'){
+      var el = trouver(d.label);
+      if (el){
+        pointer(el, !!d.click, d.label);
+        versParent({ type:'voice-found', voiceId:d.voiceId });
+      } else {
+        // ÉTAPE 2 — findByText a échoué : on demande à l'IA de l'app de
+        // relier ce que la personne a dit au vrai libellé d'un bouton.
+        // (ex: "valider ma commande" -> "Finaliser l'achat")
+        __resolvePending[d.voiceId] = { click: !!d.click, label: d.label };
+        versParent({
+          type: 'voice-resolve-request',
+          voiceId: d.voiceId,
+          label: d.label,
+          elements: labelsCliquables()
+        });
+      }
+    }
+    else if (d.type === 'voice-resolve-response'){
+      var pend = __resolvePending[d.voiceId];
+      var cible = d.cible ? trouver(d.cible) : null;
+      if (cible){
+        delete __resolvePending[d.voiceId];
+        pointer(cible, pend ? pend.click : false, d.cible);
+        versParent({ type:'voice-found', voiceId:d.voiceId, resolvedBy:'ia' });
+      } else {
+        // ÉTAPE 3 — OCR : le libellé est peut-être écrit DANS une image
+        // (bouton-image sans texte HTML). On envoie à l'app les images
+        // cliquables ; elle les lit avec puter.ai.img2txt et nous dit
+        // laquelle correspond.
+        var imgs = imagesCliquables();
+        if (imgs.length){
+          versParent({
+            type: 'voice-ocr-request',
+            voiceId: d.voiceId,
+            label: pend ? pend.label : d.cible,
+            images: imgs
+          });
+        } else {
+          delete __resolvePending[d.voiceId];
+          versParent({ type:'voice-miss', voiceId:d.voiceId });
+        }
+      }
+    }
+    else if (d.type === 'voice-ocr-response'){
+      var pend2 = __resolvePending[d.voiceId];
+      delete __resolvePending[d.voiceId];
+      var el2 = d.id ? document.querySelector('[data-nav-id="' + d.id + '"]') : null;
+      if (el2){
+        pointer(el2, pend2 ? pend2.click : false, pend2 ? pend2.label : '');
+        versParent({ type:'voice-found', voiceId:d.voiceId, resolvedBy:'ocr' });
+      } else {
+        versParent({ type:'voice-miss', voiceId:d.voiceId });
+      }
+    }
+    else if (d.type === 'nav-back'){ try { history.back(); } catch(e){} }
+    else if (d.type === 'tts-speak-page'){
+      var main = document.querySelector('main, article, [role=main], #content, .content') || document.body;
+      var txt = (main.innerText || '').replace(/\s+/g,' ').trim().slice(0, 9000);
+      try { window.postMessage({ source:'ohapiday-app', type:'tts-speak', text: txt }, '*'); } catch(e){}
+    }
+    else if (d.type === 'explique-mot'){
+      versParent({ type:'explique-request', word: d.mot, context: '' });
+    }
+    else if (d.type === 'voice-list-elements'){
+      var labels = cliquables().map(function(el){ return (el.innerText || el.value || '').trim().slice(0, 50); })
+        .filter(Boolean).slice(0, 60);
+      versParent({ type:'voice-elements', elements: labels });
+    }
+  });
+
+  // signale que la page est prête (pour enchaîner "va sur X puis...")
+  function pret(){ versParent({ type:'page-ready', url: (function(){ try { return new URLSearchParams(location.search).get('url') || location.href; } catch(e){ return location.href; } })() }); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', pret);
+  else pret();
+})();`;
+}
