@@ -758,6 +758,7 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
     }
   }, true);
   function sendReady() {
+    __versionPage++;
     try {
       window.parent.postMessage({
         source: 'ohapiday-bridge',
@@ -787,6 +788,150 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
     if (bad.test(s)) return '[filtered]';
     return s.replace(/\\s+/g, ' ').trim();
   }
+  // ═══════════════════════════════════════════════════════════════
+  //  LE CONTENU DE LA PAGE — pas seulement ses boutons
+  // ═══════════════════════════════════════════════════════════════
+  //  Avant, Astrid ne recevait que des libelles de boutons : elle
+  //  DEVINAIT ce que la page demande. Elle ne pouvait pas dire
+  //  "tu as jusqu'au 22 mai" parce que la date n'etait nulle part.
+  //
+  //  Le Markdown coute ~8x moins que le HTML brut, et surtout il
+  //  GARDE LA STRUCTURE : un innerText transforme un tableau
+  //  d'echeances en bouillie, et c'est la que vivent les dates.
+  // Incremente a chaque 'ready'. L'app sait ainsi si la page a change
+  // et si elle doit renvoyer le contenu a l'IA, ou s'en passer.
+  var __versionPage = 0;
+
+  function extraireMarkdown(opts) {
+    opts = opts || {};
+    var MAX = opts.max || 1500;
+
+    // ─── 1. Trouver la zone de contenu ───
+    function zonePrincipale() {
+      var cands = document.querySelectorAll('main, article, [role=main], #content, .content, #main');
+      for (var i = 0; i < cands.length; i++) {
+        if ((cands[i].innerText || '').trim().length > 200) return cands[i];
+      }
+      // Pas de balise semantique : on devine. Beaucoup de texte et peu
+      // de liens = du contenu. L'inverse = un menu.
+      var best = document.body, bestScore = 0;
+      var blocs = document.querySelectorAll('div, section');
+      for (var j = 0; j < blocs.length && j < 300; j++) {
+        var b = blocs[j];
+        var t = (b.innerText || '').trim().length;
+        var liens = b.querySelectorAll('a').length;
+        var score = t - liens * 40;   // un lien "pese" 40 caracteres de bruit
+        if (score > bestScore) { bestScore = score; best = b; }
+      }
+      return best;
+    }
+
+    var JETER = 'script,style,noscript,nav,header,footer,aside,form,iframe,svg,'
+              + '[role=navigation],[role=banner],[role=contentinfo],[aria-hidden=true],'
+              + '.cookie,.cookies,#cookie,.banner,.pub,.ad,.ads,.publicite,.newsletter';
+
+    var zone, clone;
+    try {
+      zone = zonePrincipale();
+      // On travaille sur un CLONE : retirer des noeuds du vrai DOM
+      // casserait la page sous les yeux de la personne.
+      clone = zone.cloneNode(true);
+      var vires = clone.querySelectorAll(JETER);
+      for (var k = 0; k < vires.length; k++) vires[k].remove();
+    } catch (e) { return null; }
+
+    // ─── 2. Convertir ───
+    var out = [];
+    var vu = 0;
+    var RE_TITRE = new RegExp('^h[1-6]$');
+    var DIESE = String.fromCharCode(35);        // #
+    var TIRET = String.fromCharCode(45);        // -
+    var BARRE = String.fromCharCode(124);       // |
+    var SAUT  = String.fromCharCode(10);        // saut de ligne
+    // Un template literal mange les antislashs : on construit les regex
+    // des espaces se transformait en "tous les s", qui etaient remplaces.
+    // les regex par RegExp(), sans aucune sequence echappee.
+    var RE_ESPACES = new RegExp('[' + String.fromCharCode(32,9,10,13) + ']+', 'g');
+    function texte(el) {
+      return (el.textContent || '').replace(RE_ESPACES, ' ').trim();
+    }
+
+    function marcher(el) {
+      if (vu > MAX * 3) return;   // marge : on tronque proprement a la fin
+      for (var i = 0; i < el.children.length; i++) {
+        var c = el.children[i];
+        var tag = c.tagName.toLowerCase();
+        var t;
+
+        if (RE_TITRE.test(tag)) {
+          t = texte(c);
+          if (t) {
+            var n = parseInt(tag.charAt(1), 10);
+            var d = '';
+            for (var z = 0; z < n; z++) d += DIESE;
+            out.push(SAUT + d + ' ' + t);
+            vu += t.length;
+          }
+          continue;
+        }
+        if (tag === 'p') {
+          t = texte(c);
+          if (t.length > 2) { out.push(t); vu += t.length; }
+          continue;
+        }
+        if (tag === 'li') {
+          t = texte(c);
+          if (t) { out.push(TIRET + ' ' + t); vu += t.length; }
+          continue;
+        }
+        if (tag === 'a') {
+          t = texte(c);
+          var h = c.getAttribute('href');
+          if (t && h && h.indexOf('#') !== 0) {
+            out.push('[' + t + '](' + h + ')');
+            vu += t.length;
+          }
+          continue;
+        }
+        if (tag === 'table') {
+          // LE PLUS IMPORTANT : dates limites, montants, seuils et
+          // baremes vivent dans les tableaux des pages administratives.
+          var lignes = c.querySelectorAll('tr');
+          for (var r = 0; r < lignes.length && r < 12; r++) {
+            var cells = lignes[r].querySelectorAll('td,th');
+            var row = [];
+            for (var cc = 0; cc < cells.length; cc++) row.push(texte(cells[cc]));
+            if (row.join('').trim()) {
+              out.push(BARRE + ' ' + row.join(' ' + BARRE + ' ') + ' ' + BARRE);
+              vu += row.join('').length;
+            }
+          }
+          continue;
+        }
+        if (tag === 'br') continue;
+        if (c.children.length) { marcher(c); }
+        else {
+          t = texte(c);
+          if (t.length > 2) { out.push(t); vu += t.length; }
+        }
+      }
+    }
+
+    try { marcher(clone); } catch (e) {}
+
+    var md = out.join(SAUT)
+      .replace(new RegExp(SAUT + '{3,}', 'g'), SAUT + SAUT)
+      .replace(new RegExp('[' + String.fromCharCode(32,9) + ']{2,}', 'g'), ' ')
+      .trim();
+
+    return {
+      titre: (document.title || '').trim().slice(0, 120),
+      markdown: md.slice(0, MAX),
+      tronque: md.length > MAX,
+      caracteres: Math.min(md.length, MAX)
+    };
+  }
+
   function extractDOM() {
     var sel = 'a, button, input, select, textarea, [role="button"], [role="link"]';
     var nodes = document.querySelectorAll(sel);
@@ -812,9 +957,16 @@ function buildBridgeScript(proxyOrigin, targetRoot) {
       }
       elements.push({ tag: el.tagName.toLowerCase(), label: label, selector: selector });
     }
+    // Le CONTENU, pas seulement les boutons. Une seule fois par page :
+    // il ne change pas entre deux questions, inutile de le renvoyer.
+    var contenu = null;
+    try { contenu = extraireMarkdown({ max: 1500 }); } catch (e) {}
+
     return {
       title: sanitizeLabel(document.title || ''),
       elements: elements,
+      contenu: contenu,
+      versionPage: __versionPage,
       isLimited: nodes.length > MAX,
       totalInteractive: nodes.length
     };
